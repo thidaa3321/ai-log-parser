@@ -1,0 +1,33 @@
+# src/ai_log_parser/config/default_config.yaml
+
+queue:
+  max_size: 1000
+
+connectors:
+  - type: file
+    name: syslog-local
+    path: tests/corpus/sample_syslog.log
+    poll_interval: 0.25
+    tail: false
+
+  - type: file
+    name: cef-local
+    path: tests/corpus/sample_cef.log
+    poll_interval: 0.25
+    tail: false
+
+  - type: syslog
+    name: suricata-514
+    host: 0.0.0.0
+    port: 5140
+    protocol: udp
+
+  - type: s3
+    name: cloudtrail-localstack
+    bucket: e2e-cloudtrail
+    prefix: AWSLogs/
+    endpoint_url: http://localhost:4566
+    aws_access_key_id: test
+    aws_secret_access_key: test
+    region_name: us-east-1
+    poll_interval: 5.0 
