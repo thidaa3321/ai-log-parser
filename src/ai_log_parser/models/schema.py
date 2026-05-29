@@ -1,4 +1,4 @@
-# ai_log_parser/models/schema.py
+# src/ai_log_parser/models/schema.py
 
 """
 NormalizedLog — Pydantic Schema 2.0 for the AI Dynamic Log Parser.
@@ -9,7 +9,8 @@ Design
   Pydantic model.
 * event_hash replaces event_id as the unique event identifier.
   It is always the SHA256 of the raw log line — stable, pipeline-computed,
-  never AI-generated.
+  never AI-generated. Used as the dedup key, OCSF activity_id, and CEF
+  event_hash extension field across all output formats.
 * ts_source tracks whether event_ts came from the original log or was
   set by the pipeline as ingestion time.
 * Self-healing validators automatically fix common 1.5b model errors:
@@ -27,7 +28,8 @@ Design
 
 Fields
 ------
-event_hash        : SHA256(raw) — unique event ID, pipeline-computed
+event_hash        : SHA256(raw) — unique event ID, pipeline-computed,
+                    used as dedup key, OCSF activity_id, CEF event_hash
 event_ts          : ISO8601 UTC — extracted from log or ingestion time
 ts_source         : "original" | "ingestion" — tracks event_ts origin
 source_host       : hostname of the log source
@@ -40,7 +42,6 @@ target            : target resource
 dst_ip            : destination IP address
 message           : human-readable log message
 raw               : original raw log line — never modified
-raw_hash          : SHA256(raw) — same as event_hash, kept for compatibility
 extras            : any additional fields the AI extracted
 confidence        : float 0.0–1.0 — AI self-reported parse certainty
 review_flag       : true when confidence < 0.7 or validation failed
@@ -88,48 +89,26 @@ def _compute_hash(raw: str) -> str:
 
 
 def _is_ip(value: str) -> bool:
-    """Return True if value looks like an IPv4 or IPv6 address."""
     return bool(_RE_IPV4.match(value) or _RE_IPV6.match(value))
 
 
 def _is_hostname_not_ip(value: str) -> bool:
-    """Return True if value looks like a bare hostname, not an IP."""
     return bool(_RE_HOSTNAME_ONLY.match(value))
 
 
 def _date_in_raw(date_str: str, raw: str) -> bool:
-    """
-    Return True if any recognisable date component from date_str
-    appears in the raw log string.
-
-    Checks for year (4 digits), full date (YYYY-MM-DD), and common
-    syslog month abbreviations with matching time.
-    """
     if not date_str or not raw:
         return False
-
-    # Extract year from ISO timestamp e.g. "2024-01-01T12:00:01Z"
     year_match = re.search(r"(\d{4})", date_str)
-    if year_match:
-        year = year_match.group(1)
-        if year in raw:
-            return True
-
-    # Extract YYYY-MM-DD
+    if year_match and year_match.group(1) in raw:
+        return True
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", date_str)
-    if date_match:
-        if date_match.group(1) in raw:
-            return True
-
-    # Syslog month abbreviations
-    months = (
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    )
+    if date_match and date_match.group(1) in raw:
+        return True
+    months = ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
     for month in months:
         if month in raw and month in date_str:
             return True
-
     return False
 
 
@@ -151,15 +130,18 @@ class NormalizedLog(BaseModel):
     )
 
     # --- Identity ---
-    event_hash:   str = Field(
-        description="SHA256(raw) — pipeline-computed unique event ID"
+    event_hash: str = Field(
+        description=(
+            "SHA256(raw) — unique event ID, pipeline-computed. "
+            "Used as dedup key, OCSF activity_id, and CEF event_hash extension field."
+        )
     )
 
     # --- Timing ---
-    event_ts:   str = Field(
+    event_ts:  str = Field(
         description="ISO8601 UTC timestamp — from log or ingestion time"
     )
-    ts_source:  Literal["original", "ingestion"] = Field(
+    ts_source: Literal["original", "ingestion"] = Field(
         default="ingestion",
         description="Tracks whether event_ts came from the log or pipeline",
     )
@@ -168,32 +150,31 @@ class NormalizedLog(BaseModel):
     source_host: str | None = Field(default=None)
 
     # --- Classification ---
-    category:   str = Field(default="other")
+    category:   str       = Field(default="other")
     action:     str | None = Field(default=None)
-    outcome:    str = Field(default="unknown")
+    outcome:    str       = Field(default="unknown")
 
     # --- Actor ---
     actor_user: str | None = Field(default=None)
 
     # --- Network ---
-    src_ip:     str | None = Field(default=None)
-    dst_ip:     str | None = Field(default=None)
-    target:     str | None = Field(default=None)
+    src_ip:  str | None = Field(default=None)
+    dst_ip:  str | None = Field(default=None)
+    target:  str | None = Field(default=None)
 
     # --- Content ---
-    message:    str | None = Field(default=None)
-    raw:        str = Field(description="Original raw log line — never modified")
-    raw_hash:   str = Field(description="SHA256(raw) — alias of event_hash")
+    message: str | None = Field(default=None)
+    raw:     str        = Field(description="Original raw log line — never modified")
 
     # --- AI metadata ---
     extras:     dict[str, Any] = Field(default_factory=dict)
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence: float          = Field(default=0.0, ge=0.0, le=1.0)
 
     # --- Routing ---
-    review_flag:       bool       = Field(default=False)
-    validation_issues: list[str]  = Field(default_factory=list)
+    review_flag:       bool      = Field(default=False)
+    validation_issues: list[str] = Field(default_factory=list)
 
-    # --- Pre-processor hint (optional — used by self_heal) ---
+    # --- Pre-processor hint ---
     format_hint: str | None = Field(default=None)
 
     # ------------------------------------------------------------------
@@ -203,23 +184,18 @@ class NormalizedLog(BaseModel):
     @field_validator("category", mode="before")
     @classmethod
     def validate_category(cls, v: Any) -> str:
-        if v not in _VALID_CATEGORIES:
-            return "other"
-        return v
+        return v if v in _VALID_CATEGORIES else "other"
 
     @field_validator("outcome", mode="before")
     @classmethod
     def validate_outcome(cls, v: Any) -> str:
-        if v not in _VALID_OUTCOMES:
-            return "unknown"
-        return v
+        return v if v in _VALID_OUTCOMES else "unknown"
 
     @field_validator("confidence", mode="before")
     @classmethod
     def validate_confidence(cls, v: Any) -> float:
         try:
-            f = float(v)
-            return max(0.0, min(1.0, f))
+            return max(0.0, min(1.0, float(v)))
         except (ValueError, TypeError):
             return 0.0
 
@@ -229,18 +205,12 @@ class NormalizedLog(BaseModel):
         if v is None:
             return None
         s = str(v).strip()
-        if not s:
-            return None
-        if _is_ip(s):
-            return s
-        return None
+        return s if (s and _is_ip(s)) else None
 
     @field_validator("extras", mode="before")
     @classmethod
     def validate_extras(cls, v: Any) -> dict:
-        if not isinstance(v, dict):
-            return {}
-        return v
+        return v if isinstance(v, dict) else {}
 
     # ------------------------------------------------------------------
     # Model validator — cross-field self-healing
@@ -254,28 +224,18 @@ class NormalizedLog(BaseModel):
 
         Fixes applied (in order)
         ------------------------
-        1. Syslog RFC3164: no year in format — null event_ts, use ingestion
-           time. Not flagged as hallucination — known format limitation.
-        2. IP/Hostname Fix: if src_ip contains a hostname, move it to
-           source_host (if null) and null out src_ip.
-        3. Hallucination Check: if event_ts date is not present in raw,
-           override with ingestion time, set ts_source=ingestion,
-           force review_flag=True, append to validation_issues.
-           Skipped for syslog_rfc3164 (handled in Fix 1).
-        4. event_hash: always recomputed from raw.
-        5. raw_hash: always set equal to event_hash.
-        6. review_flag: set True if confidence < CONFIDENCE_GATE.
-        7. ingestion time fallback if event_ts still missing.
+        1. Syslog RFC3164 — no year in format, null event_ts, ingestion time.
+        2. IP/Hostname Fix — hostname in src_ip moved to source_host.
+        3. Hallucination Check — event_ts not in raw → ingestion time.
+        4. event_hash — always pipeline-computed from raw.
+        5. review_flag — set True if confidence < CONFIDENCE_GATE.
+        6. ingestion time fallback if event_ts still missing.
         """
-        issues: list[str] = list(data.get("validation_issues") or [])
+        issues:      list[str] = list(data.get("validation_issues") or [])
         raw         = str(data.get("raw", ""))
         format_hint = data.get("format_hint", "")
 
-        # --- Fix 1: Syslog RFC3164 — no year in format ---
-        # RFC3164 timestamps are "May  1 12:00:01" with no year.
-        # The AI will always invent a year not present in the raw text.
-        # Correct behaviour: null event_ts → pipeline sets ingestion time.
-        # This is a known format limitation — not flagged as hallucination.
+        # --- Fix 1: Syslog RFC3164 ---
         if format_hint == "syslog_rfc3164":
             data["event_ts"]  = None
             data["ts_source"] = "ingestion"
@@ -304,8 +264,7 @@ class NormalizedLog(BaseModel):
                     )
                 data["src_ip"] = None
 
-        # --- Fix 3: Hallucination Check on event_ts ---
-        # Skipped for syslog_rfc3164 — handled in Fix 1.
+        # --- Fix 3: Hallucination Check ---
         event_ts = data.get("event_ts")
         if event_ts and raw and format_hint != "syslog_rfc3164":
             if not _date_in_raw(str(event_ts), raw):
@@ -323,9 +282,7 @@ class NormalizedLog(BaseModel):
 
         # --- Fix 4: event_hash — always pipeline-computed ---
         if raw:
-            computed_hash      = _compute_hash(raw)
-            data["event_hash"] = computed_hash
-            data["raw_hash"]   = computed_hash
+            data["event_hash"] = _compute_hash(raw)
 
         # --- Fix 5: review_flag from confidence ---
         try:
@@ -335,7 +292,7 @@ class NormalizedLog(BaseModel):
         if conf < CONFIDENCE_GATE:
             data["review_flag"] = True
 
-        # --- Fix 6: ingestion time fallback if event_ts missing ---
+        # --- Fix 6: ingestion time fallback ---
         if not data.get("event_ts"):
             data["event_ts"]  = datetime.now(timezone.utc).isoformat()
             data["ts_source"] = "ingestion"
@@ -344,20 +301,15 @@ class NormalizedLog(BaseModel):
         return data
 
     # ------------------------------------------------------------------
-    # Class method — safe construction with quarantine fallback
+    # Safe construction
     # ------------------------------------------------------------------
 
     @classmethod
     def safe_parse(cls, raw_dict: dict[str, Any]) -> "NormalizedLog":
         """
         Construct a NormalizedLog from a raw dict.
-
-        On ValidationError, returns a quarantine-safe NormalizedLog with:
-            - review_flag = True
-            - confidence  = 0.0
-            - validation_issues listing every field that failed
-
-        Never raises — always returns a valid NormalizedLog instance.
+        On ValidationError returns a quarantine-safe fallback.
+        Never raises.
         """
         from pydantic import ValidationError
 
@@ -369,9 +321,8 @@ class NormalizedLog(BaseModel):
                 for err in exc.errors()
             ]
             raw      = str(raw_dict.get("raw", ""))
-            raw_hash = _compute_hash(raw) if raw else ""
             fallback = {
-                "event_hash":        raw_hash,
+                "event_hash":        _compute_hash(raw) if raw else "",
                 "event_ts":          datetime.now(timezone.utc).isoformat(),
                 "ts_source":         "ingestion",
                 "source_host":       None,
@@ -384,7 +335,6 @@ class NormalizedLog(BaseModel):
                 "target":            None,
                 "message":           f"[VALIDATION FAILURE] {'; '.join(issues)}",
                 "raw":               raw,
-                "raw_hash":          raw_hash,
                 "extras":            {},
                 "confidence":        0.0,
                 "review_flag":       True,
@@ -398,9 +348,7 @@ class NormalizedLog(BaseModel):
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a plain dict representation of the event."""
         return self.model_dump()
 
     def is_confident(self) -> bool:
-        """Return True if the event passed the confidence gate."""
         return not self.review_flag 
